@@ -1,50 +1,93 @@
 import numpy as np
-from PIL import Image
+import matplotlib.pyplot as plt
+from skimage.measure import label, regionprops
+from skimage.io import imread
+from pathlib import Path
 
-def get_vec(img):
-    w, h = img.size
-    s = max(w, h)
-    new = Image.new('L', (s, s), 0)
-    new.paste(img, ((s - w) // 2, (s - h) // 2))
-    return np.array(new.resize((20, 20))).flatten()
+output_dir = Path(__file__).parent / "recognition_results"
+output_dir.mkdir(exist_ok=True)
 
-def find_objs(img):
-    pix = img.load()
-    w, h = img.size
-    visited = set()
-    objs = []
-    for y in range(h):
-        for x in range(w):
-            if pix[x, y] == 255 and (x, y) not in visited:
-                q, pts = [(x, y)], []
-                visited.add((x, y))
-                while q:
-                    cx, cy = q.pop()
-                    pts.append((cx, cy))
-                    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
-                        nx, ny = cx+dx, cy+dy
-                        if 0<=nx<w and 0<=ny<h and pix[nx,ny]==255 and (nx,ny) not in visited:
-                            visited.add((nx,ny)); q.append((nx,ny))
-                xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-                x1, y1, x2, y2 = min(xs), min(ys), max(xs)+1, max(ys)+1
-                if x2 - x1 >= 2:
-                    objs.append({'img': img.crop((x1, y1, x2, y2)), 'x': x1})
-    return objs
+def get_holes_count(region_obj):
+    padded_img = np.pad(region_obj.image, pad_width=1, mode='constant', constant_values=0)
+    inverted = np.logical_not(padded_img)
+    labeled_bg = label(inverted)
+    return np.max(labeled_bg)
 
-t_img = Image.open('alphabet-small.png').convert('L').point(lambda p: 255 if p < 128 else 0)
-labels = ['A', 'B', '8', '0', '1', 'W', 'X', '*', '-', '/']
-t_objs = sorted(find_objs(t_img), key=lambda o: o['x'])
+def calc_lower_density(img_matrix):
+    h, w = img_matrix.shape
+    dy = max(1, h // 10)
+    dx = max(1, w // 10)
+    
+    left_corner = img_matrix[-dy:, :dx].mean()
+    right_corner = img_matrix[-dy:, -dx:].mean()
+    return (left_corner + right_corner) / 2.0
 
-templates = {labels[i]: get_vec(t_objs[i]['img']) for i in range(len(labels))}
+def extract_features(region_obj):
+    img = region_obj.image
+    height, width = img.shape
+    
+    y0, x0 = region_obj.centroid_local
+    norm_y = y0 / height
+    norm_x = x0 / width
+    
+    num_holes = get_holes_count(region_obj)
+    ecc = region_obj.eccentricity
+    bottom_corners = calc_lower_density(img)
+    aspect_ratio = height / width
+    
+    return np.array([num_holes, aspect_ratio, ecc, norm_y, norm_x, bottom_corners])
 
-m_img = Image.open('alphabet.png').convert('L').point(lambda p: 255 if p > 1 else 0)
-found = find_objs(m_img)
-res = {l: 0 for l in labels}
+def predict_symbol(target_features, reference_dict):
+    best_match = "?"
+    min_dist = float('inf')
+    
+    for sym, ref_features in reference_dict.items():
+        dist = np.linalg.norm(ref_features - target_features)
+        if dist < min_dist:
+            min_dist = dist
+            best_match = sym
+            
+    return best_match
 
-for f in found:
-    v = get_vec(f['img'])
-    best = min(templates.keys(), key=lambda l: np.linalg.norm(v - templates[l]))
-    res[best] += 1
+template_image = imread("alphabet-small.png")[:, :, :3].sum(axis=2)
+binary_template = template_image != 765.0
 
-for l in labels:
-    print(f"{l}: {res[l]}")
+labeled_template = label(binary_template)
+template_props = regionprops(labeled_template)
+
+known_classes = ["8", "0", "A", "B", "1", "W", "X", "*", "/", "-"]
+reference_data = {}
+
+for prop, symbol in zip(template_props, known_classes):
+    reference_data[symbol] = extract_features(prop)
+
+target_image = imread("alphabet.png")[:, :, :3]
+binary_target = target_image.mean(axis=2) > 0
+labeled_target = label(binary_target)
+
+print(f"Всего объектов найдено: {np.max(labeled_target)}")
+
+target_props = regionprops(labeled_target)
+stats = {}
+
+plt.figure(figsize=(5, 7))
+
+for idx, prop in enumerate(target_props):
+    predicted = predict_symbol(extract_features(prop), reference_data)
+    
+    stats[predicted] = stats.get(predicted, 0) + 1
+    
+    plt.clf()
+    plt.title(f"класс: '{predicted}'")
+    plt.imshow(prop.image, cmap='gray')
+    plt.savefig(output_dir / f"char_{prop.label:03d}.png")
+
+print("\nстатистика распознавания:", stats)
+
+errors = stats.get("?", 0)
+accuracy = (1 - errors / len(target_props)) * 100
+print(f"пРоцент распознавания: {accuracy:.2f}%")
+
+plt.imshow(binary_target, cmap='gray')
+plt.title("изображение для распознавания")
+plt.show()
